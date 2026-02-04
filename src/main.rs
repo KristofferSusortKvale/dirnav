@@ -13,6 +13,7 @@ use std::sync::OnceLock;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use pulldown_cmark::{Event as MdEvent, Options, Parser, Tag, TagEnd};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -64,6 +65,13 @@ struct DirEntry {
     is_dir: bool,
 }
 
+/// Preview mode for files.
+#[derive(Clone, Copy, PartialEq)]
+enum PreviewMode {
+    Raw,      // Syntax highlighted source
+    Rendered, // Markdown rendered view (only for .md files)
+}
+
 /// All state the UI needs to render and react to input.
 struct App {
     /// Current directory we're showing.
@@ -80,8 +88,12 @@ struct App {
     preview_content: Option<Vec<Line<'static>>>,
     /// Vertical scroll offset for the preview (number of lines scrolled down).
     preview_scroll: usize,
+    /// Maximum scroll value for current preview (updated during rendering).
+    preview_scroll_max: usize,
     /// True when the preview only shows the first part of the file (file exceeded limit).
     preview_truncated: bool,
+    /// Current preview mode (raw or rendered).
+    preview_mode: PreviewMode,
 }
 
 impl App {
@@ -94,7 +106,9 @@ impl App {
             preview_path: None,
             preview_content: None,
             preview_scroll: 0,
+            preview_scroll_max: 0,
             preview_truncated: false,
+            preview_mode: PreviewMode::Raw,
         };
         app.refresh_entries();
         app
@@ -157,11 +171,22 @@ impl App {
         // File: open preview panel on the right.
         let path = self.cwd.join(&entry.name);
         if path.is_file() {
-            let (content, truncated) = load_file_preview(&path);
+            // Determine if this is a markdown file
+            let is_markdown = path.extension().and_then(|e| e.to_str()) == Some("md");
+            let mode = if is_markdown { PreviewMode::Rendered } else { PreviewMode::Raw };
+            
+            let (content, truncated) = if mode == PreviewMode::Rendered {
+                load_markdown_preview(&path)
+            } else {
+                load_file_preview(&path)
+            };
+            
             self.preview_content = Some(content);
             self.preview_path = Some(path);
             self.preview_scroll = 0;
+            self.preview_scroll_max = 0;
             self.preview_truncated = truncated;
+            self.preview_mode = mode;
         }
     }
 
@@ -170,13 +195,47 @@ impl App {
         self.preview_path = None;
         self.preview_content = None;
         self.preview_scroll = 0;
+        self.preview_scroll_max = 0;
         self.preview_truncated = false;
+        self.preview_mode = PreviewMode::Raw;
+    }
+
+    /// Toggle between raw and rendered preview mode (only for markdown files).
+    fn toggle_preview_mode(&mut self) {
+        // Only toggle if we have a markdown file open
+        let is_markdown = self.preview_path
+            .as_ref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str()) == Some("md");
+        
+        if !is_markdown {
+            return;
+        }
+        
+        // Toggle mode
+        self.preview_mode = match self.preview_mode {
+            PreviewMode::Raw => PreviewMode::Rendered,
+            PreviewMode::Rendered => PreviewMode::Raw,
+        };
+        
+        // Reload preview with new mode
+        if let Some(ref path) = self.preview_path.clone() {
+            let (content, truncated) = if self.preview_mode == PreviewMode::Rendered {
+                load_markdown_preview(path)
+            } else {
+                load_file_preview(path)
+            };
+            self.preview_content = Some(content);
+            self.preview_truncated = truncated;
+            self.preview_scroll = 0;
+            self.preview_scroll_max = 0;
+        }
     }
 
     /// Scroll preview down (j). No-op if preview closed.
     fn preview_scroll_down(&mut self) {
         if self.preview_content.is_some() {
-            self.preview_scroll = self.preview_scroll.saturating_add(1);
+            self.preview_scroll = (self.preview_scroll.saturating_add(1)).min(self.preview_scroll_max);
         }
     }
 
@@ -308,8 +367,292 @@ fn load_file_preview(path: &std::path::Path) -> (Vec<Line<'static>>, bool) {
     (out, truncated)
 }
 
+/// Load and render markdown file as styled lines.
+/// Returns (lines, truncated) where truncated is true if the file was larger than the limit.
+fn load_markdown_preview(path: &std::path::Path) -> (Vec<Line<'static>>, bool) {
+    let mut out: Vec<Line<'static>> = Vec::new();
+
+    const MAX_PREVIEW_BYTES: usize = 512 * 1024;
+    let content = match fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            out.push(plain_line(format!("Error reading: {}", e)));
+            return (out, false);
+        }
+    };
+    
+    if content.is_empty() {
+        out.push(plain_line("(empty file)"));
+        return (out, false);
+    }
+    
+    let truncated = content.len() > MAX_PREVIEW_BYTES;
+    let text = if truncated {
+        &content[..MAX_PREVIEW_BYTES]
+    } else {
+        content.as_slice()
+    };
+    
+    let content_str = match String::from_utf8(text.to_vec()) {
+        Ok(s) => s,
+        Err(_) => {
+            out.push(plain_line("(not valid UTF-8)"));
+            return (out, false);
+        }
+    };
+
+    // Parse markdown with pulldown-cmark
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TABLES);
+    let parser = Parser::new_ext(&content_str, options);
+
+    let mut current_line_spans: Vec<Span<'static>> = Vec::new();
+    let mut list_depth: usize = 0;
+    let mut in_code_block = false;
+    let mut code_block_lang: Option<String> = None;
+    let mut code_block_content = String::new();
+    let mut current_style = Style::default();
+    let mut in_blockquote = false;
+
+    for event in parser {
+        match event {
+            MdEvent::Start(tag) => match tag {
+                Tag::Heading { level, .. } => {
+                    // Finish previous line if any
+                    if !current_line_spans.is_empty() {
+                        out.push(Line::from(current_line_spans.clone()));
+                        current_line_spans.clear();
+                    }
+                    // Add spacing before heading
+                    if !out.is_empty() {
+                        out.push(plain_line(""));
+                    }
+                    // Style based on heading level
+                    current_style = match level {
+                        pulldown_cmark::HeadingLevel::H1 => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                        pulldown_cmark::HeadingLevel::H2 => Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+                        pulldown_cmark::HeadingLevel::H3 => Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                        _ => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    };
+                }
+                Tag::Paragraph => {
+                    // Add spacing before paragraph (unless it's the first element)
+                    if !out.is_empty() && !current_line_spans.is_empty() {
+                        out.push(Line::from(current_line_spans.clone()));
+                        current_line_spans.clear();
+                    }
+                }
+                Tag::CodeBlock(kind) => {
+                    in_code_block = true;
+                    code_block_lang = match kind {
+                        pulldown_cmark::CodeBlockKind::Fenced(lang) => Some(lang.to_string()),
+                        _ => None,
+                    };
+                    code_block_content.clear();
+                    // Add spacing before code block
+                    if !current_line_spans.is_empty() {
+                        out.push(Line::from(current_line_spans.clone()));
+                        current_line_spans.clear();
+                    }
+                    if !out.is_empty() {
+                        out.push(plain_line(""));
+                    }
+                }
+                Tag::List(_) => {
+                    list_depth += 1;
+                    if !current_line_spans.is_empty() {
+                        out.push(Line::from(current_line_spans.clone()));
+                        current_line_spans.clear();
+                    }
+                }
+                Tag::Item => {
+                    if !current_line_spans.is_empty() {
+                        out.push(Line::from(current_line_spans.clone()));
+                        current_line_spans.clear();
+                    }
+                    // Add indentation and bullet
+                    let indent = "  ".repeat(list_depth.saturating_sub(1));
+                    current_line_spans.push(Span::styled(
+                        format!("{}• ", indent),
+                        Style::default().fg(Color::Yellow),
+                    ));
+                }
+                Tag::Emphasis => {
+                    current_style = current_style.add_modifier(Modifier::ITALIC);
+                }
+                Tag::Strong => {
+                    current_style = current_style.add_modifier(Modifier::BOLD);
+                }
+                Tag::Strikethrough => {
+                    current_style = current_style.add_modifier(Modifier::CROSSED_OUT);
+                }
+                Tag::BlockQuote(_) => {
+                    if !current_line_spans.is_empty() {
+                        out.push(Line::from(current_line_spans.clone()));
+                        current_line_spans.clear();
+                    }
+                    in_blockquote = true;
+                    // Prefix will be added when we encounter text
+                }
+                _ => {}
+            },
+            MdEvent::End(tag_end) => match tag_end {
+                TagEnd::Heading(_) => {
+                    if !current_line_spans.is_empty() {
+                        out.push(Line::from(current_line_spans.clone()));
+                        current_line_spans.clear();
+                    }
+                    out.push(plain_line(""));
+                    current_style = Style::default();
+                }
+                TagEnd::Paragraph => {
+                    if !current_line_spans.is_empty() {
+                        out.push(Line::from(current_line_spans.clone()));
+                        current_line_spans.clear();
+                    }
+                    out.push(plain_line(""));
+                }
+                TagEnd::CodeBlock => {
+                    in_code_block = false;
+                    // Try syntax highlighting if language is known
+                    if let Some(lang) = code_block_lang.as_ref() {
+                        let ps = syntax_set();
+                        let ts = theme_set();
+                        let syntax = ps
+                            .find_syntax_by_token(lang)
+                            .unwrap_or_else(|| ps.find_syntax_plain_text());
+                        let theme = ts
+                            .themes
+                            .get("base16-eighties.dark")
+                            .or_else(|| ts.themes.values().next())
+                            .expect("theme set has at least one theme");
+                        let mut highlighter = HighlightLines::new(syntax, theme);
+                        
+                        for line in LinesWithEndings::from(&code_block_content) {
+                            let line_spans: Vec<Span> = match highlighter.highlight_line(line, ps) {
+                                Ok(segments) => segments
+                                    .into_iter()
+                                    .map(|(syntect_style, text)| {
+                                        let mut style = Style::default();
+                                        if let Some(c) = syntect_color_to_ratatui(syntect_style.foreground) {
+                                            style = style.fg(c);
+                                        }
+                                        let mods = syntect_font_style_to_modifier(syntect_style.font_style);
+                                        if !mods.is_empty() {
+                                            style = style.add_modifier(mods);
+                                        }
+                                        Span::styled(text.to_string(), style)
+                                    })
+                                    .collect(),
+                                Err(_) => vec![Span::raw(line.to_string())],
+                            };
+                            out.push(Line::from(line_spans));
+                        }
+                    } else {
+                        // No language, just use monospace style
+                        for line in code_block_content.lines() {
+                            out.push(Line::from(Span::styled(
+                                line.to_string(),
+                                Style::default().fg(Color::Gray),
+                            )));
+                        }
+                    }
+                    code_block_lang = None;
+                    code_block_content.clear();
+                    out.push(plain_line(""));
+                }
+                TagEnd::List(_) => {
+                    list_depth = list_depth.saturating_sub(1);
+                    if !current_line_spans.is_empty() {
+                        out.push(Line::from(current_line_spans.clone()));
+                        current_line_spans.clear();
+                    }
+                }
+                TagEnd::Item => {
+                    if !current_line_spans.is_empty() {
+                        out.push(Line::from(current_line_spans.clone()));
+                        current_line_spans.clear();
+                    }
+                }
+                TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
+                    current_style = Style::default();
+                }
+                TagEnd::BlockQuote(_) => {
+                    if !current_line_spans.is_empty() {
+                        out.push(Line::from(current_line_spans.clone()));
+                        current_line_spans.clear();
+                    }
+                    in_blockquote = false;
+                }
+                _ => {}
+            },
+            MdEvent::Text(text) => {
+                if in_code_block {
+                    code_block_content.push_str(&text);
+                } else {
+                    // Add blockquote prefix if we're starting a new line in a blockquote
+                    if in_blockquote && current_line_spans.is_empty() {
+                        current_line_spans.push(Span::styled(
+                            "│ ",
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
+                    current_line_spans.push(Span::styled(text.to_string(), current_style));
+                }
+            }
+            MdEvent::Code(code) => {
+                // Inline code
+                if in_blockquote && current_line_spans.is_empty() {
+                    current_line_spans.push(Span::styled(
+                        "│ ",
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+                current_line_spans.push(Span::styled(
+                    code.to_string(),
+                    Style::default().fg(Color::Magenta),
+                ));
+            }
+            MdEvent::SoftBreak => {
+                if in_blockquote {
+                    // In blockquote, soft breaks should create new lines with prefix
+                    out.push(Line::from(current_line_spans.clone()));
+                    current_line_spans.clear();
+                } else {
+                    current_line_spans.push(Span::raw(" "));
+                }
+            }
+            MdEvent::HardBreak => {
+                out.push(Line::from(current_line_spans.clone()));
+                current_line_spans.clear();
+            }
+            MdEvent::Rule => {
+                if !current_line_spans.is_empty() {
+                    out.push(Line::from(current_line_spans.clone()));
+                    current_line_spans.clear();
+                }
+                out.push(plain_line(""));
+                out.push(Line::from(Span::styled(
+                    "─".repeat(60),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                out.push(plain_line(""));
+            }
+            _ => {}
+        }
+    }
+
+    // Flush any remaining spans
+    if !current_line_spans.is_empty() {
+        out.push(Line::from(current_line_spans));
+    }
+
+    (out, truncated)
+}
+
 /// Draw the full UI into the given frame. This is called every frame after handling input.
-fn ui(frame: &mut Frame, app: &App) {
+fn ui(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
     // Vertical layout: [path bar] [list] [hints]
@@ -378,12 +721,21 @@ fn ui(frame: &mut Frame, app: &App) {
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "Preview".to_string());
-        let title = if app.preview_truncated {
-            format!(" {} (first 512 KB) ", base_title)
-        } else {
-            format!(" {} ", base_title)
+        
+        let mode_indicator = match app.preview_mode {
+            PreviewMode::Rendered => " [rendered]",
+            PreviewMode::Raw => "",
         };
-        let scroll_max = content.len().saturating_sub(rect.height as usize);
+        
+        let title = if app.preview_truncated {
+            format!(" {}{} (first 512 KB) ", base_title, mode_indicator)
+        } else {
+            format!(" {}{} ", base_title, mode_indicator)
+        };
+        // Account for borders (top + bottom = 2 lines) when calculating scroll range
+        let inner_height = rect.height.saturating_sub(2) as usize;
+        let scroll_max = content.len().saturating_sub(inner_height);
+        app.preview_scroll_max = scroll_max;
         let scroll = app.preview_scroll.min(scroll_max);
         let block = Block::default()
             .borders(Borders::ALL)
@@ -398,7 +750,7 @@ fn ui(frame: &mut Frame, app: &App) {
     }
 
     // ---- Key hints ----
-    let hints = Line::from(vec![
+    let mut hint_spans = vec![
         Span::styled(" ↑/↓ ", Style::default().fg(Color::DarkGray)),
         Span::raw("or "),
         Span::styled(" k/j ", Style::default().fg(Color::DarkGray)),
@@ -409,13 +761,30 @@ fn ui(frame: &mut Frame, app: &App) {
         Span::raw("up  "),
         Span::styled(" H ", Style::default().fg(Color::DarkGray)),
         Span::raw("toggle hidden  "),
-        Span::styled(" Esc ", Style::default().fg(Color::DarkGray)),
-        Span::raw("close preview / quit  "),
-        Span::styled(" j/k ", Style::default().fg(Color::DarkGray)),
-        Span::raw("scroll in preview  "),
-        Span::styled(" q ", Style::default().fg(Color::DarkGray)),
-        Span::raw("quit"),
-    ]);
+    ];
+    
+    // Add toggle hint only for markdown files
+    if app.preview_path.is_some() {
+        let is_markdown = app.preview_path
+            .as_ref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str()) == Some("md");
+        
+        if is_markdown {
+            hint_spans.push(Span::styled(" t ", Style::default().fg(Color::DarkGray)));
+            hint_spans.push(Span::raw("toggle render  "));
+        }
+        
+        hint_spans.push(Span::styled(" j/k ", Style::default().fg(Color::DarkGray)));
+        hint_spans.push(Span::raw("scroll  "));
+    }
+    
+    hint_spans.push(Span::styled(" Esc ", Style::default().fg(Color::DarkGray)));
+    hint_spans.push(Span::raw("close/quit  "));
+    hint_spans.push(Span::styled(" q ", Style::default().fg(Color::DarkGray)));
+    hint_spans.push(Span::raw("quit"));
+    
+    let hints = Line::from(hint_spans);
     let hint_para = Paragraph::new(hints).block(
         Block::default()
             .borders(Borders::ALL)
@@ -428,7 +797,7 @@ fn run_app(terminal: &mut ratatui::Terminal<CrosstermBackend<Stdout>>, mut app: 
     loop {
         // Draw current state. Ratatui uses double buffering: we draw to an internal buffer,
         // then on draw() it's swapped to the terminal in one go to avoid flicker.
-        terminal.draw(|f| ui(f, &app))?;
+        terminal.draw(|f| ui(f, &mut app))?;
 
         // Block until we get an event. This is why we don't need a "sleep" in the loop —
         // the thread blocks on key press.
@@ -479,6 +848,9 @@ fn run_app(terminal: &mut ratatui::Terminal<CrosstermBackend<Stdout>>, mut app: 
             KeyCode::Char('H') => {
                 app.show_hidden = !app.show_hidden;
                 app.refresh_entries();
+            }
+            KeyCode::Char('t') => {
+                app.toggle_preview_mode();
             }
             _ => {}
         }

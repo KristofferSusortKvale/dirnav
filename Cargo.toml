@@ -6,5 +6,6 @@ edition = "2024"
 [dependencies]
 color-eyre = "0.6.5"
 crossterm = "0.29.0"
+pulldown-cmark = "0.12"
 ratatui = "0.30.0"
 syntect = "5.3"
